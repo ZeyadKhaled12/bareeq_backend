@@ -39,10 +39,25 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'drf_spectacular',  # Add this
     'catalogue',
     'orders',
     'users'
 ]
+
+REST_FRAMEWORK = {
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Bareeq Laundry API',
+    'DESCRIPTION': 'API documentation for Orders, Invoices, and User Management',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    # Optional: adds the "Authorize" button for login
+    'COMPONENT_SPLIT_PATCH': True,
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
