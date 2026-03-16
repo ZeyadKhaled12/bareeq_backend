@@ -16,10 +16,9 @@ Including another URLconf
 """
 
 from django.contrib import admin
-from django.urls import path
 from django.conf import settings
 from django.conf.urls.static import static
-from django.urls import path
+from django.urls import path, include  # Import includ
 from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
 urlpatterns = [
@@ -30,6 +29,10 @@ urlpatterns = [
          name='swagger-ui'),
     # Optional: Redoc UI (an alternative to Swagger)
     path('api/redoc/', SpectacularRedocView.as_view(url_name='schema'), name='redoc'),
+    path('api/users/', include('users.urls')),
+    path('api/lists/', include('lists.urls')),
+    path('api/locations/', include('locations.urls')),
+    path('api/catalogue/', include('catalogue.urls')),
 ]
 
 # This allows the browser to access the photos during development

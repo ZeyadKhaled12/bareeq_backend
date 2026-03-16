@@ -52,10 +52,18 @@ class InvoiceAdmin(admin.ModelAdmin):
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ('barcode', 'status', 'created_at')
-    list_filter = ('status', 'created_at')
-    search_fields = ('barcode',)
-    inlines = [OrderItemInline]
+    list_display = ('barcode', 'customer', 'vendor', 'status', 'total_display')
+    list_filter = ('status', 'vendor')
+    search_fields = ('barcode', 'customer__user__username')
+
+    # Add comment to the detail view
+    fields = ('barcode', 'status', 'customer',
+              'vendor', 'delivery_fee', 'comment')
+    readonly_fields = ('barcode',)
+
+    def total_display(self, obj):
+        return f"{obj.calculate_totals()['total']} EGP"
+    total_display.short_description = "Total Amount"
 
     # Optional: Colors for the status
     def get_form(self, request, obj=None, **kwargs):

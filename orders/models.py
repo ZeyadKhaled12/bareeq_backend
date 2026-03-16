@@ -4,6 +4,12 @@ import uuid
 from decimal import Decimal  # <--- MUST ADD THIS FOR MATH
 
 
+from django.db import models
+from catalogue.models import Item, Service, ItemServicePrice
+import uuid
+from decimal import Decimal
+
+
 class Order(models.Model):
     STATUS_CHOICES = [
         ('PENDING', 'قيد الانتظار - لم يتم الاستلام بعد (Pending Pickup)'),
@@ -18,41 +24,53 @@ class Order(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES,
                               default='PENDING', verbose_name="حالة الطلب (Status)")
 
-    # ADD THIS: To allow custom delivery fees per order
+    # 1. NEW FIELD: Comment
+    comment = models.TextField(
+        null=True, blank=True, verbose_name="ملاحظات (Comment)")
+
     delivery_fee = models.DecimalField(
         max_digits=10, decimal_places=2, default=20.00, verbose_name="مصاريف التوصيل")
-
     created_at = models.DateTimeField(
         auto_now_add=True, verbose_name="تاريخ الطلب (Date)")
+
+    # Vendor and Customer relationships
+    vendor = models.ForeignKey('users.UserProfile', on_delete=models.CASCADE, related_name='vendor_orders', limit_choices_to={
+                               'role': 'VENDOR'}, verbose_name="المحل (Vendor)", null=True, blank=True)
+    customer = models.ForeignKey('users.UserProfile', on_delete=models.SET_NULL, null=True, blank=True,
+                                 related_name='customer_orders', limit_choices_to={'role': 'CUSTOMER'}, verbose_name="العميل (Customer)")
 
     class Meta:
         verbose_name = "طلب"
         verbose_name_plural = "الطلبات (Orders)"
 
-    # --- ADD THESE FUNCTIONS START ---
-
     def calculate_totals(self):
-        """ Calculates math based on Egyptian standards """
+        """ Calculates math including the new percentage logic """
         subtotal = Decimal('0.00')
-        # Get every service selected for every item in this order
+
+        # 2. UPDATED LOGIC: Calculating Picked Services
         for item in self.items.all():
             for selected in item.selected_services.all():
-                subtotal += selected.item_service_price.price
+                price_obj = selected.item_service_price
+                # Add base price
+                subtotal += price_obj.price
+
+                # If there is a percentage (e.g. for special handling), add it to subtotal
+                if price_obj.percentage > 0:
+                    percentage_amount = price_obj.price * \
+                        (price_obj.percentage / Decimal('100.00'))
+                    subtotal += percentage_amount
 
         vat_amount = subtotal * Decimal('0.14')  # 14% VAT
         total_amount = subtotal + vat_amount + self.delivery_fee
 
         return {
-            'subtotal': subtotal,
-            'vat_amount': vat_amount,
-            'total': total_amount
+            'subtotal': subtotal.quantize(Decimal('0.01')),
+            'vat_amount': vat_amount.quantize(Decimal('0.01')),
+            'total': total_amount.quantize(Decimal('0.01'))
         }
 
     def generate_invoice(self):
-        """ Syncs the Invoice model with current order data """
         calc = self.calculate_totals()
-
-        # This will create the invoice if it doesn't exist, or update it if it does
         inv, created = Invoice.objects.update_or_create(
             order=self,
             defaults={
@@ -65,22 +83,16 @@ class Order(models.Model):
         )
         return inv
 
-    # --- ADD THESE FUNCTIONS END ---
-
     def save(self, *args, **kwargs):
         if not self.barcode:
             self.barcode = f"ORD-{uuid.uuid4().hex[:6].upper()}"
-
-        # Save the order first so we can access related items
         super().save(*args, **kwargs)
-
-        # Trigger invoice generation automatically when finished
         if self.status == 'FINISHED':
             self.generate_invoice()
 
     def __str__(self):
         return f"{self.barcode} - {self.get_status_display()}"
-
+    
     # ... previous fields ...
     vendor = models.ForeignKey(
         'users.UserProfile',
