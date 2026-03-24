@@ -5,7 +5,6 @@ from .models import Location
 from .serializers import LocationSerializer
 
 
-# This groups EVERYTHING in this class together
 @extend_schema(tags=["Locations"])
 class LocationListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsAuthenticated]
@@ -14,13 +13,15 @@ class LocationListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         """
         Returns all locations belonging to the authenticated user.
+        Includes a check for Swagger to prevent crashes during schema generation.
         """
+        # FIX: Check if this is a documentation generation request
+        if getattr(self, 'swagger_fake_view', False):
+            return Location.objects.none()
+
         return Location.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        """
-        Saves a new location and automatically links it to the token owner.
-        """
         serializer.save(user=self.request.user)
 
     @extend_schema(
@@ -44,7 +45,10 @@ class LocationDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = LocationSerializer
 
     def get_queryset(self):
-        # SECURITY: Users can only see/edit/delete their own locations
+        # FIX: Check if this is a documentation generation request
+        if getattr(self, 'swagger_fake_view', False):
+            return Location.objects.none()
+
         return Location.objects.filter(user=self.request.user)
 
     @extend_schema(summary="Get a specific location detail")

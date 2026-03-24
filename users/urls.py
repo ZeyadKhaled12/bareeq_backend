@@ -3,7 +3,8 @@ from .views import (
     CustomerLoginView, VendorLoginView,
     CustomerRegisterView, VendorRegisterView,
     CustomerProfileView, VendorProfileView,
-    PasswordChangeView, VendorTimeSlotView
+    PasswordChangeView, VendorTimeSlotView, VendorSlotsByRegionView,
+    VendorEmployeeManagementView
 )
 
 urlpatterns = [
@@ -21,4 +22,8 @@ urlpatterns = [
     path('vendor/profile/', VendorProfileView.as_view(), name='vendor-profile'),
     path('vendor/time-slots/', VendorTimeSlotView.as_view(),
          name='vendor-time-slots'),
+    path('public-vendor-slots/', VendorSlotsByRegionView.as_view(),
+         name='vendor-slots-by-region'),
+    path('employees/', VendorEmployeeManagementView.as_view(),
+         name='vendor-employees'),
 ]

@@ -1,38 +1,44 @@
-
-from .models import TimeSlot
-from rest_framework_simplejwt.tokens import RefreshToken
-from django.contrib.auth import get_user_model
 import re
-from rest_framework import serializers
+from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from rest_framework.validators import UniqueValidator
-from .models import UserProfile
-from lists.models import Gender
 from django.db.models import Q
-from django.contrib.auth import authenticate
+from rest_framework import serializers
+from rest_framework.validators import UniqueValidator
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from .models import UserProfile, TimeSlot
+from lists.models import Gender
+
+User = get_user_model()
+
+# --- AUTHENTICATION SERIALIZERS ---
+# users/serializers.py
+
+
+class VendorTimeSlotSerializer(serializers.ModelSerializer):
+    """Serializer for managing individual time slots"""
+    class Meta:
+        model = TimeSlot
+        fields = [
+            'id', 'day', 'slot', 'slot_type',
+            'is_free', 'unlimit_orders', 'limit_orders', 'is_close'
+        ]
 
 
 class CustomerRegistrationSerializer(serializers.ModelSerializer):
-    # 1. Username Unique Check
     username = serializers.CharField(
         required=True,
         validators=[UniqueValidator(
             queryset=User.objects.all(), message="هذا الاسم مستخدم بالفعل")]
     )
-
-    # 2. Email Format & Unique Check
     email = serializers.EmailField(
         required=True,
         validators=[UniqueValidator(queryset=User.objects.all(
         ), message="هذا البريد الإلكتروني مسجل مسبقاً")]
     )
-
-    # 3. Password Strength
     password = serializers.CharField(write_only=True, required=True)
-
-    # 4. Profile Fields (Write Only)
     phone = serializers.CharField(
         write_only=True,
         required=True,
@@ -40,10 +46,7 @@ class CustomerRegistrationSerializer(serializers.ModelSerializer):
             queryset=UserProfile.objects.all(), message="رقم الهاتف هذا مسجل مسبقاً")]
     )
     gender = serializers.PrimaryKeyRelatedField(
-        queryset=Gender.objects.all(),
-        write_only=True,
-        required=True
-    )
+        queryset=Gender.objects.all(), write_only=True, required=True)
     date_of_birth = serializers.DateField(write_only=True, required=True)
 
     class Meta:
@@ -51,10 +54,7 @@ class CustomerRegistrationSerializer(serializers.ModelSerializer):
         fields = ['username', 'password', 'email',
                   'phone', 'gender', 'date_of_birth']
 
-    # --- CUSTOM VALIDATIONS ---
-
     def validate_password(self, value):
-        """Checks if password meets Django security standards."""
         try:
             validate_password(value)
         except DjangoValidationError as e:
@@ -62,26 +62,22 @@ class CustomerRegistrationSerializer(serializers.ModelSerializer):
         return value
 
     def validate_phone(self, value):
-        """Checks if phone number format is correct (e.g., Egyptian format)."""
         if not re.match(r'^(010|011|012|015)\d{8}$', value):
             raise serializers.ValidationError(
                 "رقم الهاتف غير صحيح. يجب أن يبدأ بـ 010 أو 011 أو 012 أو 015")
         return value
 
     def create(self, validated_data):
-        # Extract profile data
         phone = validated_data.pop('phone')
         gender = validated_data.pop('gender')
         dob = validated_data.pop('date_of_birth')
 
-        # Create User
         user = User.objects.create_user(
             username=validated_data['username'],
             email=validated_data['email'],
             password=validated_data['password']
         )
 
-        # Create Profile
         UserProfile.objects.create(
             user=user,
             role='CUSTOMER',
@@ -92,23 +88,18 @@ class CustomerRegistrationSerializer(serializers.ModelSerializer):
         return user
 
     def to_representation(self, instance):
-        # Get the standard User fields (id, username, email)
         representation = super().to_representation(instance)
-
-        # Access the profile
         profile = getattr(instance, 'profile', None)
         if profile:
-            # Add profile fields directly to the top level
             representation['phone'] = profile.phone
             representation['gender'] = profile.gender.id if profile.gender else None
             representation['date_of_birth'] = profile.date_of_birth
             representation['role'] = profile.role
-
         return representation
 
 
 class LoginSerializer(serializers.Serializer):
-    # We use 'login_id' to accept either email or phone
+    """Handles login for Shop Owners (Vendors) and Staff (Employees)"""
     login_id = serializers.CharField(required=True)
     password = serializers.CharField(write_only=True, required=True)
 
@@ -116,98 +107,57 @@ class LoginSerializer(serializers.Serializer):
         login_id = data.get('login_id')
         password = data.get('password')
 
-        # 1. Find the user by Email OR by Phone (inside UserProfile)
         user = User.objects.filter(
             Q(email=login_id) | Q(profile__phone=login_id)
-        ).first()
+        ).select_related('profile').first()
 
-        # 2. Check if user exists and password is correct
         if user and user.check_password(password):
             if not user.is_active:
-                raise serializers.ValidationError("This account is disabled.")
+                raise serializers.ValidationError("هذا الحساب معطل.")
+
+            try:
+                profile = user.profile
+            except UserProfile.DoesNotExist:
+                raise serializers.ValidationError(
+                    f"المستخدم {user.username} ليس لديه ملف شخصي.")
+
+            role = profile.role.upper()
+            if role not in ['VENDOR', 'EMPLOYEE']:
+                raise serializers.ValidationError(
+                    "هذا الرابط مخصص للمحلات والموظفين فقط.")
+
             return user
-
-        raise serializers.ValidationError("Invalid email/phone or password.")
-
-
-# users/serializers.py
+        raise serializers.ValidationError("بيانات الدخول غير صحيحة.")
 
 
-# users/serializers.py
-
-class CustomerUpdateSerializer(serializers.ModelSerializer):
-    # Map the flat fields to the nested profile model
-    phone = serializers.CharField(source='profile.phone')
-    gender = serializers.PrimaryKeyRelatedField(
-        source='profile.gender',
-        queryset=Gender.objects.all()
-    )
-    date_of_birth = serializers.DateField(source='profile.date_of_birth')
-
-    class Meta:
-        model = User
-        fields = ['username', 'email', 'phone', 'gender', 'date_of_birth']
-
-    def validate_username(self, value):
-        user = self.context['request'].user
-        if User.objects.exclude(pk=user.pk).filter(username=value).exists():
-            raise serializers.ValidationError("هذا الاسم مستخدم بالفعل")
-        return value
-
-    def validate_phone(self, value):
-        if not re.match(r'^(010|011|012|015)\d{8}$', value):
-            raise serializers.ValidationError("رقم الهاتف غير صحيح")
-        user = self.context['request'].user
-        if UserProfile.objects.exclude(user=user).filter(phone=value).exists():
-            raise serializers.ValidationError("رقم الهاتف هذا مسجل مسبقاً")
-        return value
-
-    def update(self, instance, validated_data):
-        # Extract the profile data nested by the 'source' dots
-        profile_data = validated_data.pop('profile', {})
-
-        # Update User fields
-        instance.username = validated_data.get('username', instance.username)
-        instance.email = validated_data.get('email', instance.email)
-        instance.save()
-
-        # Update Profile fields
-        profile = instance.profile
-        profile.phone = profile_data.get('phone', profile.phone)
-        profile.gender = profile_data.get('gender', profile.gender)
-        profile.date_of_birth = profile_data.get(
-            'date_of_birth', profile.date_of_birth)
-        profile.save()
-
-        return instance
-
-    def to_representation(self, instance):
-        # Reuse your registration serializer for the response to keep it consistent and flat
-        return CustomerRegistrationSerializer(instance).data
-
-
-class PasswordResetRequestSerializer(serializers.Serializer):
-    email = serializers.EmailField(required=True)
-
-
-class PasswordChangeSerializer(serializers.Serializer):
-    current_password = serializers.CharField(write_only=True)
-    new_password = serializers.CharField(write_only=True)
-    confirm_password = serializers.CharField(write_only=True)
+class CustomerLoginSerializer(serializers.Serializer):
+    """Handles login specifically for Customers"""
+    login_id = serializers.CharField(required=True)
+    password = serializers.CharField(write_only=True, required=True)
 
     def validate(self, data):
-        if data['new_password'] != data['confirm_password']:
-            raise serializers.ValidationError({
-                "confirm_password": "كلمات المرور الجديدة غير متطابقة"
-            })
-        return data
+        login_id = data.get('login_id')
+        password = data.get('password')
+
+        user = User.objects.filter(
+            Q(email=login_id) | Q(profile__phone=login_id)
+        ).select_related('profile').first()
+
+        if user and user.check_password(password):
+            if not user.is_active:
+                raise serializers.ValidationError("هذا الحساب معطل.")
+
+            if not hasattr(user, 'profile') or user.profile.role.upper() != 'CUSTOMER':
+                raise serializers.ValidationError(
+                    "هذا الرابط مخصص للعملاء فقط.")
+
+            return user
+        raise serializers.ValidationError("بيانات الدخول غير صحيحة.")
 
 
-User = get_user_model()
-
+# --- VENDOR & EMPLOYEE MANAGEMENT SERIALIZERS ---
 
 class VendorRegisterSerializer(serializers.ModelSerializer):
-    # We use 'phone' as the input, but it maps to 'username' in the database
     phone = serializers.CharField(source='username', required=True)
     full_name = serializers.CharField(source='first_name', required=True)
     email = serializers.EmailField(required=True)
@@ -225,7 +175,6 @@ class VendorRegisterSerializer(serializers.ModelSerializer):
         return value
 
     def create(self, validated_data):
-        # Because of source='username', phone is already in 'username'
         user = User.objects.create_user(
             username=validated_data['username'],
             email=validated_data['email'],
@@ -249,8 +198,61 @@ class VendorRegisterSerializer(serializers.ModelSerializer):
         }
 
 
+class EmployeeCreateSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(source='user.email')
+    full_name = serializers.CharField(source='user.first_name')
+    password = serializers.CharField(write_only=True, min_length=8)
+    phone = serializers.CharField(required=False, allow_blank=True)
+
+    class Meta:
+        model = UserProfile
+        fields = ['email', 'password', 'full_name', 'phone']
+
+    def validate_email(self, value):
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("هذا البريد مسجل مسبقاً.")
+        return value
+
+    def create(self, validated_data):
+        user_data = validated_data.pop('user')
+        email = user_data.get('email')
+        full_name = user_data.get('first_name')
+        password = validated_data.pop('password')
+        phone = validated_data.get('phone', '')
+
+        user = User.objects.create_user(
+            username=email,
+            email=email,
+            password=password,
+            first_name=full_name
+        )
+
+        vendor_profile = self.context['request'].user.profile
+        profile = UserProfile.objects.create(
+            user=user,
+            role='EMPLOYEE',
+            employer=vendor_profile,
+            phone=phone
+        )
+        return profile
+
+
+# --- PROFILE & UTILITY SERIALIZERS ---
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    """Missing class fixed here"""
+    username = serializers.CharField(source='user.username', read_only=True)
+    email = serializers.EmailField(source='user.email', read_only=True)
+    full_name = serializers.CharField(source='user.first_name', read_only=True)
+
+    class Meta:
+        model = UserProfile
+        fields = ['id', 'username', 'email',
+                  'full_name', 'phone', 'role', 'employer']
+
+
 class VendorProfileSerializer(serializers.ModelSerializer):
-    # This maps 'phone' in JSON to 'username' in the User model
+    """Missing class fixed here"""
     phone = serializers.CharField(source='username')
     full_name = serializers.CharField(source='first_name')
 
@@ -258,41 +260,48 @@ class VendorProfileSerializer(serializers.ModelSerializer):
         model = User
         fields = ['phone', 'email', 'full_name']
 
-    def validate_phone(self, value):
-        user = self.instance
-        if User.objects.exclude(pk=user.pk).filter(username=value).exists():
-            raise serializers.ValidationError("رقم الهاتف هذا مسجل لحساب آخر")
-        return value
-
     def update(self, instance, validated_data):
-        # Update User model
         instance.username = validated_data.get('username', instance.username)
         instance.email = validated_data.get('email', instance.email)
         instance.first_name = validated_data.get(
             'first_name', instance.first_name)
         instance.save()
 
-        # Sync the profile model phone number
         profile = instance.profile
         profile.phone = instance.username
         profile.save()
-
         return instance
 
 
-class UserProfileSerializer(serializers.ModelSerializer):
-    phone = serializers.CharField(source='profile.phone', read_only=True)
-    role = serializers.CharField(source='profile.role', read_only=True)
+class CustomerUpdateSerializer(serializers.ModelSerializer):
+    phone = serializers.CharField(source='profile.phone')
+    gender = serializers.PrimaryKeyRelatedField(
+        source='profile.gender', queryset=Gender.objects.all())
+    date_of_birth = serializers.DateField(source='profile.date_of_birth')
 
     class Meta:
         model = User
-        fields = ['username', 'email', 'phone', 'role']
+        fields = ['username', 'email', 'phone', 'gender', 'date_of_birth']
+
+    def update(self, instance, validated_data):
+        profile_data = validated_data.pop('profile', {})
+        instance.username = validated_data.get('username', instance.username)
+        instance.email = validated_data.get('email', instance.email)
+        instance.save()
+
+        profile = instance.profile
+        profile.phone = profile_data.get('phone', profile.phone)
+        profile.gender = profile_data.get('gender', profile.gender)
+        profile.date_of_birth = profile_data.get(
+            'date_of_birth', profile.date_of_birth)
+        profile.save()
+        return instance
+
+    def to_representation(self, instance):
+        return CustomerRegistrationSerializer(instance).data
 
 
 class VendorAuthResponseSerializer(serializers.Serializer):
-    """
-    Documentation-only serializer to define the Swagger response shape.
-    """
     class UserDataSerializer(serializers.Serializer):
         full_name = serializers.CharField()
         email = serializers.EmailField()
@@ -304,93 +313,84 @@ class VendorAuthResponseSerializer(serializers.Serializer):
     refresh = serializers.CharField()
 
 
-# 1. Handles the individual slot details
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField(required=True)
 
 
-class TimeSlotDetailSerializer(serializers.ModelSerializer):
+class PasswordChangeSerializer(serializers.Serializer):
+    current_password = serializers.CharField(write_only=True)
+    new_password = serializers.CharField(write_only=True)
+    confirm_password = serializers.CharField(write_only=True)
+
+    def validate(self, data):
+        if data['new_password'] != data['confirm_password']:
+            raise serializers.ValidationError(
+                {"confirm_password": "كلمات المرور الجديدة غير متطابقة"})
+        return data
+
+
+# --- TIME SLOT SERIALIZERS ---
+
+class TimeSlotItemSerializer(serializers.ModelSerializer):
+    is_full = serializers.SerializerMethodField()
+
     class Meta:
         model = TimeSlot
-        fields = ['slots', 'is_free', 'unlimit_orders',
-                  'limit_orders', 'is_close']
+        fields = ['id', 'slot', 'is_free', 'unlimit_orders',
+                  'limit_orders', 'is_close', 'is_full']
 
-# 2. Handles the overall structure (Monday -> Receipt -> List of slots)
+    def get_is_full(self, obj):
+        target_date = self.context.get('target_date')
+        if not target_date or obj.unlimit_orders:
+            return False
+        count = obj.orders.filter(pickup_date=target_date).count()
+        return count >= obj.limit_orders
 
 
 class VendorTimeSlotResponseSerializer(serializers.Serializer):
     def to_representation(self, instance):
-        # instance is the Vendor (User object)
         days = ['monday', 'tuesday', 'wednesday',
                 'thursday', 'friday', 'saturday', 'sunday']
         response = {}
-
         for day in days:
             response[day] = {
-                "receipt": TimeSlotDetailSerializer(
-                    instance.time_slots.filter(day=day, slot_type='receipt'), many=True
-                ).data,
-                "delivery": TimeSlotDetailSerializer(
-                    instance.time_slots.filter(day=day, slot_type='delivery'), many=True
-                ).data,
+                "receipt": TimeSlotItemSerializer(instance.time_slots.filter(day=day, slot_type='receipt'), many=True).data,
+                "delivery": TimeSlotItemSerializer(instance.time_slots.filter(day=day, slot_type='delivery'), many=True).data,
             }
         return response
 
-
-# 1. The individual slot details
-class TimeSlotRequestItemSerializer(serializers.Serializer):
-    slot = serializers.CharField(help_text="e.g. 09:00-11:00")
-    is_free = serializers.BooleanField(default=False)
-    unlimit_orders = serializers.BooleanField(default=False)
-    limit_orders = serializers.IntegerField(default=0)
-    is_close = serializers.BooleanField(default=False)
-# 1. The individual slot details (NOW WITH ID)
+# users/serializers.py
 
 
-class TimeSlotItemSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = TimeSlot
-        # We include 'id' so the frontend can reference it for orders
-        fields = ['id', 'slot', 'is_free',
-                  'unlimit_orders', 'limit_orders', 'is_close']
-
-# 2. Grouping for Receipt and Delivery
-
-
-class DayScheduleSerializer(serializers.Serializer):
-    receipt = TimeSlotItemSerializer(many=True)
-    delivery = TimeSlotItemSerializer(many=True)
-
-# 3. The Full Week Structure
+class DaySlotsSerializer(serializers.Serializer):
+    receipt = TimeSlotItemSerializer(many=True, required=False)
+    delivery = TimeSlotItemSerializer(many=True, required=False)
 
 
 class TimeSlotBulkUpdateSerializer(serializers.Serializer):
-    monday = DayScheduleSerializer()
-    tuesday = DayScheduleSerializer()
-    wednesday = DayScheduleSerializer()
-    thursday = DayScheduleSerializer()
-    friday = DayScheduleSerializer()
-    saturday = DayScheduleSerializer()
-    sunday = DayScheduleSerializer()
+    """Serializer for updating multiple time slots at once"""
+    monday = DaySlotsSerializer(required=False)
+    tuesday = DaySlotsSerializer(required=False)
+    wednesday = DaySlotsSerializer(required=False)
+    thursday = DaySlotsSerializer(required=False)
+    friday = DaySlotsSerializer(required=False)
+    saturday = DaySlotsSerializer(required=False)
+    sunday = DaySlotsSerializer(required=False)
 
+    def update_slots(self, vendor_profile):
+        slots_data = self.validated_data.get('slots', [])
+        updated_slots = []
 
-class VendorTimeSlotResponseSerializer(serializers.Serializer):
-    def to_representation(self, instance):
-        """
-        instance is the User (Vendor) object.
-        We group their time_slots by day and type.
-        """
-        days = ['monday', 'tuesday', 'wednesday',
-                'thursday', 'friday', 'saturday', 'sunday']
-        response = {}
-
-        for day in days:
-            response[day] = {
-                "receipt": TimeSlotItemSerializer(
-                    instance.time_slots.filter(day=day, slot_type='receipt'),
-                    many=True
-                ).data,
-                "delivery": TimeSlotItemSerializer(
-                    instance.time_slots.filter(day=day, slot_type='delivery'),
-                    many=True
-                ).data,
-            }
-        return response
+        for slot_data in slots_data:
+            slot_id = slot_data.get('id')
+            if slot_id:
+                # Ensure the slot belongs to this vendor for security
+                slot = TimeSlot.objects.filter(
+                    id=slot_id, vendor=vendor_profile).first()
+                if slot:
+                    for attr, value in slot_data.items():
+                        if attr != 'id':
+                            setattr(slot, attr, value)
+                    slot.save()
+                    updated_slots.append(slot)
+        return updated_slots

@@ -1,3 +1,15 @@
+# Assume UserProfileSerializer exists
+from orders.models import Order
+
+from .serializers import CustomerLoginSerializer, EmployeeCreateSerializer, UserProfileSerializer, VendorTimeSlotSerializer, VendorTimeSlotResponseSerializer
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.generics import ListCreateAPIView
+from rest_framework.permissions import AllowAny
+from .serializers import VendorTimeSlotSerializer
+from .models import TimeSlot, UserProfile
+from locations.models import Location
+from drf_spectacular.utils import extend_schema, OpenApiParameter
+from rest_framework import status
 from .models import TimeSlot
 from django.db import transaction
 from rest_framework import generics, status
@@ -52,13 +64,14 @@ class CustomerRegisterView(generics.CreateAPIView):
 class CustomerLoginView(APIView):
     @extend_schema(
         tags=['Authentication'],
-        request=LoginSerializer,
+        request=CustomerLoginSerializer,  # <--- Check if this comma is here
+        # <--- And check this one!
         responses={200: VendorAuthResponseSerializer},
         summary="Login for customer",
         description="Login with either email or phone number."
     )
     def post(self, request):
-        serializer = LoginSerializer(data=request.data)
+        serializer = CustomerLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data
         refresh = RefreshToken.for_user(user)
@@ -102,20 +115,25 @@ class VendorLoginView(APIView):
         tags=['Authentication'],
         request=LoginSerializer,
         responses={200: VendorAuthResponseSerializer},
-        summary="Login for vendor",
-        description="Login via phone/email and returns user details with JWT tokens."
+        summary="Login for Vendor & Employee",
+        description="Login via phone/email. Returns user details and role (VENDOR or EMPLOYEE)."
     )
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data
+
+        profile = user.profile
         refresh = RefreshToken.for_user(user)
 
         return Response({
             'user': {
                 'full_name': user.first_name,
                 'email': user.email,
-                'phone': user.profile.phone,
+                'phone': profile.phone,
+                'role': profile.role,  # Returns 'VENDOR' or 'EMPLOYEE'
+                # Optional: Include employer name if they are an employee
+                'business_name': profile.business_profile.user.first_name if profile.role == 'EMPLOYEE' else user.first_name
             },
             'access': str(refresh.access_token),
             'refresh': str(refresh)
@@ -219,12 +237,14 @@ class VendorTimeSlotView(APIView):
 
         try:
             with transaction.atomic():
-                # Clear all old individual slots for a clean replacement
+                # Delete old slots for this vendor
                 TimeSlot.objects.filter(vendor=user).delete()
 
                 new_slots = []
                 for day_name in days:
+                    # Get the day data (e.g., 'monday': {'receipt': [], 'delivery': []})
                     day_data = serializer.validated_data.get(day_name, {})
+
                     for s_type in ['receipt', 'delivery']:
                         items = day_data.get(s_type, [])
                         for item in items:
@@ -232,7 +252,6 @@ class VendorTimeSlotView(APIView):
                                 vendor=user,
                                 day=day_name,
                                 slot_type=s_type,
-                                # Now mapping to singular 'slot'
                                 slot=item.get('slot'),
                                 is_free=item.get('is_free', False),
                                 unlimit_orders=item.get(
@@ -241,9 +260,11 @@ class VendorTimeSlotView(APIView):
                                 is_close=item.get('is_close', False)
                             ))
 
-                TimeSlot.objects.bulk_create(new_slots)
+                if new_slots:
+                    TimeSlot.objects.bulk_create(new_slots)
 
-            return Response({"message": "Time slots updated successfully"}, status=status.HTTP_200_OK)
+            # Return the fresh data so the UI updates automatically
+            return Response(VendorTimeSlotResponseSerializer(user).data, status=status.HTTP_200_OK)
 
         except Exception as e:
             return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -262,9 +283,9 @@ class VendorTimeSlotView(APIView):
 
     @extend_schema(
         tags=['Time Slots'],
-        summary="Update All Time Slots (Sync)",
+        summary="Update All Time Slots",
         request=TimeSlotBulkUpdateSerializer,
-        responses={200: {"message": "string"}}
+        responses={200: VendorTimeSlotResponseSerializer}
     )
     def post(self, request):
         return self._handle_update(request)
@@ -273,7 +294,121 @@ class VendorTimeSlotView(APIView):
         tags=['Time Slots'],
         summary="Replace All Time Slots (PUT)",
         request=TimeSlotBulkUpdateSerializer,
-        responses={200: {"message": "string"}}
+        responses={200: VendorTimeSlotResponseSerializer}
     )
     def put(self, request):
         return self._handle_update(request)
+
+
+class VendorSlotsByRegionView(APIView):
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=['Time Slots'],
+        summary="Public Time Slots",
+        description=(
+            "Finds the vendor assigned to a region and returns their schedule. "
+            "**Required:** Provide a `date` to see which slots are full (`is_full: true`) "
+            "based on the vendor's order limits for that specific day."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="region_id",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="The ID of the region (e.g., 1)."
+            ),
+            OpenApiParameter(
+                name="date",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="The date to check (Format: YYYY-MM-DD). Example: 2026-03-25"
+            )
+        ],
+        responses={
+            200: VendorTimeSlotResponseSerializer,
+            404: {"detail": "This region is not covered by any vendor."}
+        }
+    )
+    def get(self, request):
+        region_id = request.query_params.get('region_id')
+        target_date = request.query_params.get('date')
+
+        # Basic validation
+        if not region_id or not target_date:
+            return Response(
+                {"error": "Both region_id and date (YYYY-MM-DD) are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Logic to find vendor
+        vendor_location = Location.objects.filter(
+            region_id=region_id,
+            user__profile__role='VENDOR'
+        ).select_related('user').first()
+
+        if not vendor_location:
+            return Response(
+                {"message": "No vendor covers this region."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Pass the date to the serializer context so 'is_full' can be calculated
+        serializer = VendorTimeSlotResponseSerializer(
+            vendor_location.user,
+            context={'target_date': target_date}
+        )
+        return Response(serializer.data)
+
+
+# users/views.py
+
+class VendorEmployeeManagementView(ListCreateAPIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return EmployeeCreateSerializer
+        return UserProfileSerializer
+
+    def get_queryset(self):
+        # 1. Swagger Guard
+        if getattr(self, "swagger_fake_view", False):
+            return UserProfile.objects.none()
+
+        user = self.request.user
+
+        # 2. Check if user is authenticated and has a profile
+        if not user or user.is_anonymous or not hasattr(user, 'profile'):
+            return UserProfile.objects.none()
+
+        # 3. Return the Employees that belong to this Vendor
+        return UserProfile.objects.select_related('user').filter(
+            employer=user.profile,
+            role='EMPLOYEE'
+        )
+
+    def check_vendor_role(self, user):
+        return hasattr(user, 'profile') and user.profile.role == 'VENDOR'
+
+    @extend_schema(
+        tags=['Employee Management'],
+        summary="Create Employee (Vendor Only)",
+        description="Allows a Vendor to create an account for their employee."
+    )
+    def post(self, request, *args, **kwargs):
+        if not self.check_vendor_role(request.user):
+            return Response({"error": "Only Vendors can create employees."}, status=403)
+        return super().post(request, *args, **kwargs)
+
+    @extend_schema(
+        tags=['Employee Management'],
+        summary="List My Employees",
+        description="Returns a list of all employees created by this Vendor."
+    )
+    def get(self, request, *args, **kwargs):
+        if not self.check_vendor_role(request.user):
+            return Response({"error": "Access denied."}, status=403)
+        return super().get(request, *args, **kwargs)

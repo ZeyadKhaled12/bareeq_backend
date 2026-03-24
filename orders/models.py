@@ -1,13 +1,10 @@
-from django.db import models
-from catalogue.models import Item, Service, ItemServicePrice
-import uuid
-from decimal import Decimal  # <--- MUST ADD THIS FOR MATH
-
-
+from django.dispatch import receiver
+from django.db.models.signals import post_save, post_delete
 from django.db import models
 from catalogue.models import Item, Service, ItemServicePrice
 import uuid
 from decimal import Decimal
+from django.core.exceptions import ValidationError
 
 
 class Order(models.Model):
@@ -23,95 +20,110 @@ class Order(models.Model):
         max_length=20, unique=True, editable=False, verbose_name="الباركود (Barcode)")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES,
                               default='PENDING', verbose_name="حالة الطلب (Status)")
-
-    # 1. NEW FIELD: Comment
     comment = models.TextField(
         null=True, blank=True, verbose_name="ملاحظات (Comment)")
 
+    # Pickup Details
+    time_slot = models.ForeignKey(
+        'users.TimeSlot', on_delete=models.PROTECT, related_name='pickup_orders', null=True
+    )
+    pickup_date = models.DateField(null=True, verbose_name="تاريخ الاستلام")
+
+    # Delivery Details
+    delivery_time_slot = models.ForeignKey(
+        'users.TimeSlot', on_delete=models.SET_NULL, related_name='delivery_orders',
+        null=True, blank=True
+    )
+    delivery_date = models.DateField(
+        null=True, blank=True, verbose_name="تاريخ التوصيل")
+
+    picked_services = models.ManyToManyField(
+        Service, blank=True, related_name="orders", verbose_name="الخدمات المختارة (Picked Services)"
+    )
+
+    # Pricing
     delivery_fee = models.DecimalField(
-        max_digits=10, decimal_places=2, default=20.00, verbose_name="مصاريف التوصيل")
+        max_digits=10, decimal_places=2, default=Decimal('0.00'), verbose_name="مصاريف التوصيل")
+    total_price = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'), verbose_name="إجمالي السعر")
+
+    # Relationships
     created_at = models.DateTimeField(
         auto_now_add=True, verbose_name="تاريخ الطلب (Date)")
-
-    # Vendor and Customer relationships
-    vendor = models.ForeignKey('users.UserProfile', on_delete=models.CASCADE, related_name='vendor_orders', limit_choices_to={
-                               'role': 'VENDOR'}, verbose_name="المحل (Vendor)", null=True, blank=True)
-    customer = models.ForeignKey('users.UserProfile', on_delete=models.SET_NULL, null=True, blank=True,
-                                 related_name='customer_orders', limit_choices_to={'role': 'CUSTOMER'}, verbose_name="العميل (Customer)")
+    vendor = models.ForeignKey(
+        'users.UserProfile', on_delete=models.CASCADE, related_name='vendor_orders',
+        limit_choices_to={'role': 'VENDOR'}, verbose_name="المحل (Vendor)", null=True, blank=True
+    )
+    customer = models.ForeignKey(
+        'users.UserProfile', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='customer_orders', limit_choices_to={'role': 'CUSTOMER'}, verbose_name="العميل (Customer)"
+    )
+    customer_region = models.ForeignKey(
+        'lists.Region', on_delete=models.PROTECT, related_name='customer_orders_at_region',
+        verbose_name="منطقة العميل", null=True, blank=True
+    )
+    customer_latitude = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True)
+    customer_longitude = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True)
+    processed_by = models.ForeignKey(
+        'users.UserProfile', on_delete=models.SET_NULL, null=True, blank=True, related_name='processed_orders'
+    )
 
     class Meta:
         verbose_name = "طلب"
         verbose_name_plural = "الطلبات (Orders)"
 
-    def calculate_totals(self):
-        """ Calculates math including the new percentage logic """
+    def save(self, *args, **kwargs):
+        # 1. Ensure barcode is generated BEFORE the first save to prevent null order_key
+        if not self.barcode:
+            self.barcode = f"ORD-{uuid.uuid4().hex[:6].upper()}"
+
+        super().save(*args, **kwargs)
+
+        # 2. Automatically trigger invoice/price logic if the order is already in the DB
+        # (This handles delivery_fee updates)
+        if not kwargs.get('raw', False):
+            self.recalculate_and_invoice()
+
+    def recalculate_and_invoice(self):
+        """
+        Subtotal = (Service Prices)
+        Total = Subtotal + Delivery
+        """
+        from decimal import Decimal
         subtotal = Decimal('0.00')
 
-        # 2. UPDATED LOGIC: Calculating Picked Services
-        for item in self.items.all():
-            for selected in item.selected_services.all():
-                price_obj = selected.item_service_price
-                # Add base price
-                subtotal += price_obj.price
+        # 1. Summing the services
+        if self.pk:
+            for item in self.items.all():
+                for selected in item.selected_services.all():
+                    subtotal += selected.item_service_price.price
 
-                # If there is a percentage (e.g. for special handling), add it to subtotal
-                if price_obj.percentage > 0:
-                    percentage_amount = price_obj.price * \
-                        (price_obj.percentage / Decimal('100.00'))
-                    subtotal += percentage_amount
+        # 2. Finalizing the math
+        vat_amount = Decimal('0.00')
+        delivery = self.delivery_fee or Decimal('0.00')
+        total = subtotal + delivery
 
-        vat_amount = subtotal * Decimal('0.14')  # 14% VAT
-        total_amount = subtotal + vat_amount + self.delivery_fee
+        # 3. Update Order Table
+        from .models import Order
+        Order.objects.filter(id=self.id).update(total_price=total)
 
-        return {
-            'subtotal': subtotal.quantize(Decimal('0.01')),
-            'vat_amount': vat_amount.quantize(Decimal('0.01')),
-            'total': total_amount.quantize(Decimal('0.01'))
-        }
-
-    def generate_invoice(self):
-        calc = self.calculate_totals()
-        inv, created = Invoice.objects.update_or_create(
+        # 4. Sync Invoice Table
+        from .models import Invoice
+        Invoice.objects.update_or_create(
             order=self,
             defaults={
                 'invoice_number': f"INV-{self.barcode}",
-                'subtotal': calc['subtotal'],
-                'vat_amount': calc['vat_amount'],
-                'delivery_charge': self.delivery_fee,
-                'total_amount': calc['total']
+                'subtotal': subtotal.quantize(Decimal('0.01')),
+                'vat_amount': vat_amount,
+                'delivery_charge': delivery.quantize(Decimal('0.01')),
+                'total_amount': total.quantize(Decimal('0.01')),
             }
         )
-        return inv
-
-    def save(self, *args, **kwargs):
-        if not self.barcode:
-            self.barcode = f"ORD-{uuid.uuid4().hex[:6].upper()}"
-        super().save(*args, **kwargs)
-        if self.status == 'FINISHED':
-            self.generate_invoice()
 
     def __str__(self):
         return f"{self.barcode} - {self.get_status_display()}"
-    
-    # ... previous fields ...
-    vendor = models.ForeignKey(
-        'users.UserProfile',
-        on_delete=models.CASCADE,
-        related_name='vendor_orders',
-        limit_choices_to={'role': 'VENDOR'},
-        verbose_name="المحل (Vendor)",
-        null=True,  # <--- Add this
-        blank=True  # <--- Add this
-    )
-    customer = models.ForeignKey(
-        'users.UserProfile',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='customer_orders',
-        limit_choices_to={'role': 'CUSTOMER'},
-        verbose_name="العميل (Customer)"
-    )
 
 
 class OrderItem(models.Model):
@@ -156,7 +168,6 @@ class Invoice(models.Model):
     invoice_number = models.CharField(
         max_length=50, unique=True, editable=False, verbose_name="رقم الفاتورة (Invoice #)")
 
-    # Financial Snapshots with Bilingual Labels
     subtotal = models.DecimalField(
         max_digits=10, decimal_places=2, default=0, verbose_name="المجموع الفرعي (Subtotal)")
 

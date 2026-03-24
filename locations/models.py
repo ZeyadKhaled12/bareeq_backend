@@ -4,13 +4,12 @@ from lists.models import Region
 
 
 class Location(models.Model):
-    # 'user' is automatically linked via the Token
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name='locations'
+        related_name='locations',
+        null=True, blank=True  # Allow null for existing data
     )
-    # 'region' is required from your Cairo list
     region = models.ForeignKey(
         Region,
         on_delete=models.PROTECT,
@@ -25,4 +24,10 @@ class Location(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.name} - {self.user.phone}"
+        # Accessing phone via the related profile
+        # This assumes your UserProfile has a OneToOneField to User with related_name='profile'
+        user_phone = "No Phone"
+        if hasattr(self.user, 'profile'):
+            user_phone = self.user.profile.phone
+
+        return f"{self.name} ({user_phone})"

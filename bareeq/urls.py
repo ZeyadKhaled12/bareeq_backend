@@ -32,6 +32,7 @@ urlpatterns = [
     path('api/users/', include('users.urls')),
     path('api/lists/', include('lists.urls')),
     path('api/locations/', include('locations.urls')),
+    path('api/orders/', include('orders.urls')),  # <--- MUST HAVE THIS
     path('api/catalogue/', include('catalogue.urls')),
 ]
 

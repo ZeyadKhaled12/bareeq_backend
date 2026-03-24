@@ -52,14 +52,18 @@ class InvoiceAdmin(admin.ModelAdmin):
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ('barcode', 'customer', 'vendor', 'status', 'total_display')
+    list_display = ['barcode', 'status', 'total_price',
+                    'pickup_date']  # Use the field name here
     list_filter = ('status', 'vendor')
     search_fields = ('barcode', 'customer__user__username')
 
-    # Add comment to the detail view
-    fields = ('barcode', 'status', 'customer',
-              'vendor', 'delivery_fee', 'comment')
+    # Added 'comment' and 'picked_services' here
+    fields = ('barcode', 'status', 'customer', 'vendor',
+              'delivery_fee', 'picked_services', 'comment')
     readonly_fields = ('barcode',)
+
+    # This makes a nice side-by-side selection box for services
+    filter_horizontal = ('picked_services',)
 
     def total_display(self, obj):
         return f"{obj.calculate_totals()['total']} EGP"
