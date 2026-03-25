@@ -1,26 +1,27 @@
-from drf_spectacular.utils import extend_schema, OpenApiTypes
-from .permissions import IsVendorEmployee
-from .serializers import OrderFinishSerializer, OrderDetailSerializer
-from drf_spectacular.utils import extend_schema
-from rest_framework.parsers import MultiPartParser, FormParser
-from .serializers import ReceiveOrderSerializer, OrderDetailSerializer
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status, permissions
-from .serializers import ReceiveOrderSerializer
-from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.generics import RetrieveUpdateAPIView
-from drf_spectacular.utils import extend_schema, OpenApiExample
-from rest_framework.generics import CreateAPIView, ListAPIView
+from rest_framework.generics import CreateAPIView, ListAPIView, RetrieveUpdateAPIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
-from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiParameter
+from rest_framework.parsers import MultiPartParser, FormParser
+
+from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiParameter, OpenApiTypes
 
 from .models import Order
-from .serializers import OrderCreateSerializer, OrderDetailSerializer, OrderUpdateSerializer, ReceiveOrderSerializer
+from .permissions import IsVendorEmployee
 from .filters import OrderFilter
+from .serializers import (
+    OrderCreateSerializer,
+    OrderDetailSerializer,
+    OrderUpdateSerializer,
+    ReceiveOrderSerializer,
+    OrderFinishSerializer
+)
+
+# --- Utils ---
 
 
 class OrderPagination(PageNumberPagination):
@@ -28,11 +29,11 @@ class OrderPagination(PageNumberPagination):
     page_size_query_param = 'page_size'
     max_page_size = 100
 
+# --- Views ---
+
 
 class CustomerOrderCreateView(CreateAPIView):
-    """
-    Handles Order Creation for Customers only.
-    """
+    """ Handles Order Creation for Customers only. """
     serializer_class = OrderCreateSerializer
     permission_classes = [IsAuthenticated]
 
@@ -53,46 +54,19 @@ class CustomerOrderCreateView(CreateAPIView):
     @extend_schema(
         tags=['orders'],
         summary="Create Order (Customer Only)",
-        description=(
-            "Initiates a new order. \n\n"
-            "**Required Fields:** \n"
-            "- `customer_region`: Region ID for coverage check. \n"
-            "- `time_slot_id`: The ID of the slot picked from the public slots API. \n"
-            "- `pickup_date`: The specific date for pickup (YYYY-MM-DD)."
-        ),
-        responses={201: OrderDetailSerializer},
-        examples=[
-            OpenApiExample(
-                'Complete Order Request',
-                value={
-                    "comment": "Please be on time.",
-                    "picked_services": [1, 2],
-                    "customer_region": 1,
-                    "time_slot_id": 10,
-                    "pickup_date": "2026-03-20",
-                    "customer_latitude": 30.0444,
-                    "customer_longitude": 31.2357
-                },
-                request_only=True,
-            )
-        ]
+        responses={201: OrderDetailSerializer}
     )
     def post(self, request, *args, **kwargs):
         if not self.check_customer_role(request.user):
             actual_role = getattr(request.user.profile, 'role', 'None') if hasattr(
                 request.user, 'profile') else 'None'
             raise PermissionDenied(
-                f"Only accounts with the CUSTOMER role can create orders. Your role is: {actual_role}"
-            )
+                f"Only accounts with the CUSTOMER role can create orders. Your role is: {actual_role}")
         return super().post(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         serializer.save()
 
-
-# orders/views.py
-
-# orders/views.py
 
 class UnifiedOrderListView(ListAPIView):
     serializer_class = OrderDetailSerializer
@@ -102,7 +76,6 @@ class UnifiedOrderListView(ListAPIView):
     filterset_class = OrderFilter
 
     def get_queryset(self):
-        # 1. Swagger Guard (Stops the terminal errors)
         if getattr(self, "swagger_fake_view", False):
             return Order.objects.none()
 
@@ -112,96 +85,38 @@ class UnifiedOrderListView(ListAPIView):
 
         profile = user.profile
         role = profile.role.upper()
-
-        # Use our property to get the main business ID
         business = profile.business_profile
 
         if role in ['VENDOR', 'EMPLOYEE']:
-            # Vendors and Employees see the same set of orders
-            return Order.objects.select_related('customer', 'vendor') \
-                                .filter(vendor=business) \
-                                .order_by('-created_at')
-
+            return Order.objects.select_related('customer', 'vendor').filter(vendor=business).order_by('-created_at')
         elif role == 'CUSTOMER':
-            return Order.objects.select_related('customer', 'vendor') \
-                                .filter(customer=profile) \
-                                .order_by('-created_at')
+            return Order.objects.select_related('customer', 'vendor').filter(customer=profile).order_by('-created_at')
 
-        if user.is_superuser:
-            return Order.objects.all().order_by('-created_at')
+        return Order.objects.all().order_by('-created_at') if user.is_superuser else Order.objects.none()
 
-        return Order.objects.none()
-
-    @extend_schema(
-        tags=['orders'],
-        summary="Unified Order List (Customer, Vendor, & Employee)",
-        parameters=[
-            OpenApiParameter("status", type=str,
-                             description="Filter by status"),
-            OpenApiParameter("order_key", type=str,
-                             description="Search by order ID"),
-            OpenApiParameter("date_from", type=str,
-                             description="Start date (YYYY-MM-DD)"),
-            OpenApiParameter("date_to", type=str,
-                             description="End date (YYYY-MM-DD)"),
-        ]
-    )
+    @extend_schema(tags=['orders'], summary="Unified Order List")
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
 
 
 class CustomerOrderUpdateView(RetrieveUpdateAPIView):
-    """
-    Allows a customer to view or update their PENDING order.
-    customer_region cannot be updated here.
-    """
     serializer_class = OrderUpdateSerializer
     permission_classes = [IsAuthenticated]
-    lookup_field = 'id'  # We use the order ID in the URL
+    lookup_field = 'id'
 
     def get_queryset(self):
-        user = self.request.user
-        profile = getattr(user, 'profile', None)
-
+        profile = getattr(self.request.user, 'profile', None)
         if not profile:
-            print("DEBUG: User has no profile!")
             return Order.objects.none()
+        return Order.objects.filter(vendor=profile.business_profile).order_by('-created_at')
 
-        business = profile.business_profile
-        role = profile.role
-
-        print(f"--- DEBUG START ---")
-        print(f"Logged in as: {user.username} (Role: {role})")
-        print(f"My Profile ID: {profile.id}")
-        print(
-            f"My Employer ID: {profile.employer_id if role == 'EMPLOYEE' else 'N/A'}")
-        print(f"Targeting Business ID: {business.id}")
-
-        # Check how many orders exist for this business ID
-        count = Order.objects.filter(vendor=business).count()
-        print(f"Orders found for Vendor ID {business.id}: {count}")
-        print(f"--- DEBUG END ---")
-
-        return Order.objects.filter(vendor=business).order_by('-created_at')
-
-    @extend_schema(
-        tags=['orders'],
-        summary="Update Order (Customer Only)",
-        description=(
-            "Updates an existing order. **Restriction:** Only works if status is 'PENDING'. "
-            "The `customer_region` field is locked and cannot be changed."
-        ),
-        responses={200: OrderDetailSerializer}
-    )
+    @extend_schema(tags=['orders'], summary="Update Order (Customer Only)")
     def patch(self, request, *args, **kwargs):
         return super().patch(request, *args, **kwargs)
 
-    @extend_schema(exclude=True)  # Hide PUT from Swagger to force using PATCH
+    @extend_schema(exclude=True)
     def put(self, request, *args, **kwargs):
         return super().put(request, *args, **kwargs)
-
-
-# orders/views.py
 
 
 class OrderReceiveView(APIView):
@@ -210,413 +125,43 @@ class OrderReceiveView(APIView):
     @extend_schema(
         tags=['orders'],
         summary="Receive Order (Finalize Items & Services)",
-        description=(
-            "Transition an order from PENDING to RECEIVED. \n\n"
-            "This endpoint allows the vendor to input the actual items, services, "
-            "and set the delivery schedule. It calculates the total price and returns "
-            "the full Order model details."
-        ),
         request=ReceiveOrderSerializer,
-        responses={200: OrderDetailSerializer},
-        examples=[
-            OpenApiExample(
-                'Request Example (Input)',
-                value={
-                    "delivery_fee": 20.00,
-                    "delivery_date": "2026-03-28",
-                    "delivery_time_slot_id": 5,
-                    "items": [
-                        {
-                            "item_id": 1,
-                            "quantity": 2,
-                            "service_ids": [1, 2]
-                        }
-                    ]
-                },
-                request_only=True,
-            ),
-        ]
+        responses={200: OrderDetailSerializer}
     )
     def post(self, request, order_id):
         try:
-            # 1. Fetch Order
             order = Order.objects.get(id=order_id)
-            user_profile = request.user.profile
-
-            # 2. Authorization Check
-            if order.vendor != user_profile:
-                return Response(
-                    {"error": "You are not authorized to receive this order."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-            # 3. Process receiving logic
-            # Passing context={'request': request} is essential for processed_by
+            if order.vendor != request.user.profile:
+                return Response({"error": "Unauthorized"}, status=403)
             serializer = ReceiveOrderSerializer(
-                order,
-                data=request.data,
-                context={'request': request}
-            )
-
+                order, data=request.data, context={'request': request})
             if serializer.is_valid():
-                # This triggers the update() method in ReceiveOrderSerializer
                 updated_order = serializer.save()
-
-                # We return serializer.data which, due to to_representation,
-                # will use the OrderDetailSerializer format.
-                return Response(serializer.data, status=status.HTTP_200_OK)
-
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
+                return Response(serializer.data, status=200)
+            return Response(serializer.errors, status=400)
         except Order.DoesNotExist:
-            return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
-
-# Add this class to your orders/views.py
+            return Response({"error": "Order not found"}, status=404)
 
 
 class OrderMoveToVendorView(APIView):
-    """
-    Endpoint for Vendors/Employees to move an order from RECEIVED to AT_VENDOR.
-    """
     permission_classes = [IsAuthenticated]
 
-    @extend_schema(
-        tags=['orders'],
-        summary="Move Order to Laundry (AT_VENDOR)",
-        description="Changes order status from RECEIVED to AT_VENDOR. Only authorized for the assigned Vendor/Employee.",
-        responses={200: OrderDetailSerializer}
-    )
+    @extend_schema(tags=['orders'], summary="Move Order to Laundry (AT_VENDOR)")
     def patch(self, request, order_id):
         try:
-            # 1. Fetch Order
             order = Order.objects.get(id=order_id)
-            user_profile = request.user.profile
-            business = user_profile.business_profile  # Uses your profile property
+            if order.vendor != request.user.profile.business_profile:
+                return Response({"error": "Unauthorized"}, status=403)
 
-            # 2. Authorization Check (Verify user belongs to the assigned vendor business)
-            if order.vendor != business:
-                return Response(
-                    {"error": "You are not authorized to manage this order."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-            # 3. Status Transition Validation
             if order.status != 'RECEIVED':
-                return Response(
-                    {"error": f"Cannot move to AT_VENDOR. Current status is {order.status}."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                return Response({"error": f"Invalid status: {order.status}"}, status=400)
 
-            # 4. Perform Update
             order.status = 'AT_VENDOR'
-            order.processed_by = user_profile
-            order.save()  # This triggers your recalculate_and_invoice logic too
-
-            # 5. Return Full Detail
-            serializer = OrderDetailSerializer(
-                order, context={'request': request})
-            return Response(serializer.data, status=status.HTTP_200_OK)
-
+            order.processed_by = request.user.profile
+            order.save()
+            return Response(OrderDetailSerializer(order, context={'request': request}).data)
         except Order.DoesNotExist:
-            return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
-
-
-class OrderPagination(PageNumberPagination):
-    page_size = 10
-    page_size_query_param = 'page_size'
-    max_page_size = 100
-
-
-class CustomerOrderCreateView(CreateAPIView):
-    """
-    Handles Order Creation for Customers only.
-    """
-    serializer_class = OrderCreateSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_permissions(self):
-        if getattr(self, 'swagger_fake_view', False):
-            return []
-        return super().get_permissions()
-
-    def check_customer_role(self, user):
-        if user.is_superuser:
-            return True
-        user_role = str(getattr(user, 'role', '')).upper()
-        profile_role = ''
-        if hasattr(user, 'profile'):
-            profile_role = str(getattr(user.profile, 'role', '')).upper()
-        return user_role == 'CUSTOMER' or profile_role == 'CUSTOMER'
-
-    @extend_schema(
-        tags=['orders'],
-        summary="Create Order (Customer Only)",
-        description=(
-            "Initiates a new order. \n\n"
-            "**Required Fields:** \n"
-            "- `customer_region`: Region ID for coverage check. \n"
-            "- `time_slot_id`: The ID of the slot picked from the public slots API. \n"
-            "- `pickup_date`: The specific date for pickup (YYYY-MM-DD)."
-        ),
-        responses={201: OrderDetailSerializer},
-        examples=[
-            OpenApiExample(
-                'Complete Order Request',
-                value={
-                    "comment": "Please be on time.",
-                    "picked_services": [1, 2],
-                    "customer_region": 1,
-                    "time_slot_id": 10,
-                    "pickup_date": "2026-03-20",
-                    "customer_latitude": 30.0444,
-                    "customer_longitude": 31.2357
-                },
-                request_only=True,
-            )
-        ]
-    )
-    def post(self, request, *args, **kwargs):
-        if not self.check_customer_role(request.user):
-            actual_role = getattr(request.user.profile, 'role', 'None') if hasattr(
-                request.user, 'profile') else 'None'
-            raise PermissionDenied(
-                f"Only accounts with the CUSTOMER role can create orders. Your role is: {actual_role}"
-            )
-        return super().post(request, *args, **kwargs)
-
-    def perform_create(self, serializer):
-        serializer.save()
-
-
-# orders/views.py
-
-# orders/views.py
-
-class UnifiedOrderListView(ListAPIView):
-    serializer_class = OrderDetailSerializer
-    permission_classes = [IsAuthenticated]
-    pagination_class = OrderPagination
-    filter_backends = [DjangoFilterBackend]
-    filterset_class = OrderFilter
-
-    def get_queryset(self):
-        # 1. Swagger Guard (Stops the terminal errors)
-        if getattr(self, "swagger_fake_view", False):
-            return Order.objects.none()
-
-        user = self.request.user
-        if not user or user.is_anonymous or not hasattr(user, 'profile'):
-            return Order.objects.none()
-
-        profile = user.profile
-        role = profile.role.upper()
-
-        # Use our property to get the main business ID
-        business = profile.business_profile
-
-        if role in ['VENDOR', 'EMPLOYEE']:
-            # Vendors and Employees see the same set of orders
-            return Order.objects.select_related('customer', 'vendor') \
-                                .filter(vendor=business) \
-                                .order_by('-created_at')
-
-        elif role == 'CUSTOMER':
-            return Order.objects.select_related('customer', 'vendor') \
-                                .filter(customer=profile) \
-                                .order_by('-created_at')
-
-        if user.is_superuser:
-            return Order.objects.all().order_by('-created_at')
-
-        return Order.objects.none()
-
-    @extend_schema(
-        tags=['orders'],
-        summary="Unified Order List (Customer, Vendor, & Employee)",
-        parameters=[
-            OpenApiParameter("status", type=str,
-                             description="Filter by status"),
-            OpenApiParameter("order_key", type=str,
-                             description="Search by order ID"),
-            OpenApiParameter("date_from", type=str,
-                             description="Start date (YYYY-MM-DD)"),
-            OpenApiParameter("date_to", type=str,
-                             description="End date (YYYY-MM-DD)"),
-        ]
-    )
-    def get(self, request, *args, **kwargs):
-        return super().get(request, *args, **kwargs)
-
-
-class CustomerOrderUpdateView(RetrieveUpdateAPIView):
-    """
-    Allows a customer to view or update their PENDING order.
-    customer_region cannot be updated here.
-    """
-    serializer_class = OrderUpdateSerializer
-    permission_classes = [IsAuthenticated]
-    lookup_field = 'id'  # We use the order ID in the URL
-
-    def get_queryset(self):
-        user = self.request.user
-        profile = getattr(user, 'profile', None)
-
-        if not profile:
-            print("DEBUG: User has no profile!")
-            return Order.objects.none()
-
-        business = profile.business_profile
-        role = profile.role
-
-        print(f"--- DEBUG START ---")
-        print(f"Logged in as: {user.username} (Role: {role})")
-        print(f"My Profile ID: {profile.id}")
-        print(
-            f"My Employer ID: {profile.employer_id if role == 'EMPLOYEE' else 'N/A'}")
-        print(f"Targeting Business ID: {business.id}")
-
-        # Check how many orders exist for this business ID
-        count = Order.objects.filter(vendor=business).count()
-        print(f"Orders found for Vendor ID {business.id}: {count}")
-        print(f"--- DEBUG END ---")
-
-        return Order.objects.filter(vendor=business).order_by('-created_at')
-
-    @extend_schema(
-        tags=['orders'],
-        summary="Update Order (Customer Only)",
-        description=(
-            "Updates an existing order. **Restriction:** Only works if status is 'PENDING'. "
-            "The `customer_region` field is locked and cannot be changed."
-        ),
-        responses={200: OrderDetailSerializer}
-    )
-    def patch(self, request, *args, **kwargs):
-        return super().patch(request, *args, **kwargs)
-
-    @extend_schema(exclude=True)  # Hide PUT from Swagger to force using PATCH
-    def put(self, request, *args, **kwargs):
-        return super().put(request, *args, **kwargs)
-
-
-# orders/views.py
-
-
-class OrderReceiveView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    @extend_schema(
-        tags=['orders'],
-        summary="Receive Order (Finalize Items & Services)",
-        description=(
-            "Transition an order from PENDING to RECEIVED. \n\n"
-            "This endpoint allows the vendor to input the actual items, services, "
-            "and set the delivery schedule. It calculates the total price and returns "
-            "the full Order model details."
-        ),
-        request=ReceiveOrderSerializer,
-        responses={200: OrderDetailSerializer},
-        examples=[
-            OpenApiExample(
-                'Request Example (Input)',
-                value={
-                    "delivery_fee": 20.00,
-                    "delivery_date": "2026-03-28",
-                    "delivery_time_slot_id": 5,
-                    "items": [
-                        {
-                            "item_id": 1,
-                            "quantity": 2,
-                            "service_ids": [1, 2]
-                        }
-                    ]
-                },
-                request_only=True,
-            ),
-        ]
-    )
-    def post(self, request, order_id):
-        try:
-            # 1. Fetch Order
-            order = Order.objects.get(id=order_id)
-            user_profile = request.user.profile
-
-            # 2. Authorization Check
-            if order.vendor != user_profile:
-                return Response(
-                    {"error": "You are not authorized to receive this order."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-            # 3. Process receiving logic
-            # Passing context={'request': request} is essential for processed_by
-            serializer = ReceiveOrderSerializer(
-                order,
-                data=request.data,
-                context={'request': request}
-            )
-
-            if serializer.is_valid():
-                # This triggers the update() method in ReceiveOrderSerializer
-                updated_order = serializer.save()
-
-                # We return serializer.data which, due to to_representation,
-                # will use the OrderDetailSerializer format.
-                return Response(serializer.data, status=status.HTTP_200_OK)
-
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        except Order.DoesNotExist:
-            return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
-
-# Add this class to your orders/views.py
-
-
-class OrderMoveToVendorView(APIView):
-    """
-    Endpoint for Vendors/Employees to move an order from RECEIVED to AT_VENDOR.
-    """
-    permission_classes = [IsAuthenticated]
-
-    @extend_schema(
-        tags=['orders'],
-        summary="Move Order to Laundry (AT_VENDOR)",
-        description="Changes order status from RECEIVED to AT_VENDOR. Only authorized for the assigned Vendor/Employee.",
-        responses={200: OrderDetailSerializer}
-    )
-    def patch(self, request, order_id):
-        try:
-            # 1. Fetch Order
-            order = Order.objects.get(id=order_id)
-            user_profile = request.user.profile
-            business = user_profile.business_profile  # Uses your profile property
-
-            # 2. Authorization Check (Verify user belongs to the assigned vendor business)
-            if order.vendor != business:
-                return Response(
-                    {"error": "You are not authorized to manage this order."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-            # 3. Status Transition Validation
-            if order.status != 'RECEIVED':
-                return Response(
-                    {"error": f"Cannot move to AT_VENDOR. Current status is {order.status}."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # 4. Perform Update
-            order.status = 'AT_VENDOR'
-            order.processed_by = user_profile
-            order.save()  # This triggers your recalculate_and_invoice logic too
-
-            # 5. Return Full Detail
-            serializer = OrderDetailSerializer(
-                order, context={'request': request})
-            return Response(serializer.data, status=status.HTTP_200_OK)
-
-        except Order.DoesNotExist:
-            return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Order not found"}, status=404)
 
 
 class OrderFinishView(APIView):
@@ -625,34 +170,24 @@ class OrderFinishView(APIView):
 
     @extend_schema(
         tags=['orders'],
-        summary="Finish Order (Upload Photos from Device)",
+        summary="Finish Order (Upload Photos)",
         description=(
-            "Moves order to FINISHED. \n\n"
-            "**In Swagger UI:** \n"
-            "1. Click 'Add Item' for `items_data`. \n"
-            "2. Enter the `item_id`. \n"
-            "3. Click 'Add Item' for `photos`. \n"
-            "4. You will see a **Choose File** button appear."
+            "Upload photos for items to finish the order. \n\n"
+            "**Note:** To see the file upload buttons in Swagger, ensure you select "
+            "'multipart/form-data' in the 'Request body' dropdown if it isn't selected."
         ),
         request={
             'multipart/form-data': {
                 'type': 'object',
                 'properties': {
                     'items_data': {
+                        'type': 'string',
+                        'description': 'JSON string containing item_id and photo mappings. Example: [{"item_id": 1}]',
+                    },
+                    'photos': {
                         'type': 'array',
-                        'items': {
-                            'type': 'object',
-                            'properties': {
-                                'item_id': {'type': 'integer'},
-                                'photos': {
-                                    'type': 'array',
-                                    'items': {
-                                        'type': 'string',
-                                        'format': 'binary'  # This forces the "Choose File" button
-                                    }
-                                }
-                            }
-                        }
+                        'items': {'type': 'string', 'format': 'binary'},
+                        'description': 'Select multiple files here'
                     }
                 }
             }
@@ -662,8 +197,15 @@ class OrderFinishView(APIView):
     def post(self, request, order_id):
         try:
             order = Order.objects.get(id=order_id)
+            user_profile = request.user.profile
+            user_business = user_profile.business_profile
 
-            if order.vendor != request.user.profile.business_profile:
+            # DEBUGGING: Look at your terminal when you hit the API
+            print(f"DEBUG: Order Vendor ID: {order.vendor.id}")
+            print(f"DEBUG: Logged-in Business ID: {user_business.id}")
+            print(f"DEBUG: User Role: {user_profile.role}")
+
+            if order.vendor != user_business:
                 return Response({"error": "Unauthorized vendor access."}, status=403)
 
             serializer = OrderFinishSerializer(
@@ -679,6 +221,109 @@ class OrderFinishView(APIView):
                     status=200
                 )
             return Response(serializer.errors, status=400)
+        except Order.DoesNotExist:
+            return Response({"error": "Order not found"}, status=404)
+
+
+class OrderDeliverView(APIView):
+    permission_classes = [IsVendorEmployee]
+
+    @extend_schema(
+        tags=['orders'],
+        summary="Deliver Order (RETURNED)",
+        description="Switch status from FINISHED to RETURNED when customer picks up items.",
+        responses={200: OrderDetailSerializer}
+    )
+    def patch(self, request, order_id):
+        try:
+            order = Order.objects.get(id=order_id)
+
+            # Authorization check
+            if order.vendor != request.user.profile.business_profile:
+                return Response({"error": "Unauthorized"}, status=403)
+
+            # Business Logic: Can only deliver if it's finished
+            if order.status != 'FINISHED':
+                return Response(
+                    {"error": f"Cannot deliver order in {order.status} status. Must be FINISHED."},
+                    status=400
+                )
+
+            order.status = 'RETURNED'
+            order.save()
+
+            return Response(OrderDetailSerializer(order, context={'request': request}).data)
+        except Order.DoesNotExist:
+            return Response({"error": "Order not found"}, status=404)
+
+
+class OrderPayInvoiceView(APIView):
+    permission_classes = [IsVendorEmployee]
+
+    @extend_schema(
+        tags=['orders'],
+        summary="Mark Invoice as Paid",
+        description="Sets 'is_paid' to true for the order's invoice.",
+        responses={200: {"message": "Invoice marked as paid"}}
+    )
+    def patch(self, request, order_id):
+        try:
+            order = Order.objects.get(id=order_id)
+
+            if order.vendor != request.user.profile.business_profile:
+                return Response({"error": "Unauthorized"}, status=403)
+
+            # Access the related invoice
+            invoice = order.invoice
+            if invoice.is_paid:
+                return Response({"message": "Invoice is already paid."}, status=200)
+
+            invoice.is_paid = True
+            invoice.save()
+
+            return Response({
+                "message": "Invoice marked as paid successfully.",
+                "invoice_number": invoice.invoice_number,
+                "is_paid": invoice.is_paid
+            }, status=200)
 
         except Order.DoesNotExist:
             return Response({"error": "Order not found"}, status=404)
+        except Exception as e:
+            return Response({"error": "Invoice not found for this order."}, status=404)
+
+
+class CustomerOrderCancelView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=['orders'],
+        summary="Cancel Order (Customer Only)",
+        description="Allows a customer to cancel their own order only if it is still PENDING.",
+        responses={200: {"message": "Order canceled successfully"},
+                   400: {"error": "Reason"}}
+    )
+    def patch(self, request, order_id):
+        try:
+            # Look for the order belonging specifically to this customer
+            order = Order.objects.get(
+                id=order_id, customer=request.user.profile)
+
+            # Check if it's already canceled or moved past pending
+            if order.status == 'CANCELED':
+                return Response({"error": "Order is already canceled."}, status=400)
+
+            if order.status != 'PENDING':
+                return Response(
+                    {"error": f"Cannot cancel order. Current status is {order.status}. "
+                     "Only PENDING orders can be canceled."},
+                    status=400
+                )
+
+            order.status = 'CANCELED'
+            order.save()
+
+            return Response({"message": "Order has been canceled successfully."}, status=200)
+
+        except Order.DoesNotExist:
+            return Response({"error": "Order not found or you do not have permission to cancel it."}, status=404)

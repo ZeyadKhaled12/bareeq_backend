@@ -1,3 +1,6 @@
+from .models import OrderItem
+import json
+
 from .models import Order, OrderItem
 from .models import OrderItem, Order
 import uuid
@@ -23,7 +26,8 @@ class InvoiceSerializer(serializers.ModelSerializer):
         model = Invoice
         fields = ['invoice_number', 'subtotal', 'vat_amount',
                   'delivery_charge', 'total_amount', 'is_paid', 'issued_at']
-        
+
+
 class OrderItemDetailSerializer(serializers.Serializer):
     """
     Formats the grouped items for the frontend.
@@ -273,39 +277,66 @@ class OrderStatusUpdateSerializer(serializers.ModelSerializer):
 
 
 class OrderFinishItemSerializer(serializers.Serializer):
-    item_id = serializers.IntegerField(help_text="The ID of the OrderItem")
-    # Swagger needs to see this as a list of files
+    item_id = serializers.IntegerField()
+    # Ensure this is ImageField, NOT CharField or FileField
     photos = serializers.ListField(
-        child=serializers.ImageField(allow_empty_file=False, use_url=False),
-        min_length=1,
-        help_text="Upload one or more images for this specific item"
+        child=serializers.ImageField()
     )
 
 
 class OrderFinishSerializer(serializers.Serializer):
-    items_data = OrderFinishItemSerializer(many=True)
+    items_data = serializers.JSONField()
 
-    def validate(self, data):
-        order = self.context['order']
-        required_ids = set(order.items.values_list('id', flat=True))
-        provided_ids = {item['item_id'] for item in data['items_data']}
+    def to_internal_value(self, data):
+        # Handle Swagger/MultiPart string issue
+        if 'items_data' in data and isinstance(data['items_data'], str):
+            try:
+                if hasattr(data, 'dict'):
+                    data = data.dict()
+                else:
+                    data = dict(data)
+                data['items_data'] = json.loads(data['items_data'])
+            except json.JSONDecodeError:
+                raise serializers.ValidationError(
+                    {"items_data": "Invalid JSON format."})
+        return super().to_internal_value(data)
 
-        missing = required_ids - provided_ids
-        if missing:
-            raise serializers.ValidationError(
-                f"Missing photos for Item IDs: {list(missing)}")
-        return data
+    def validate(self, attrs):
+        order = self.context.get('order')
+        items_data = attrs.get('items_data', [])
+
+        # Look for 'item_type_id' (the catalog ID) inside this order's items
+        valid_catalog_ids = list(
+            order.items.values_list('item_type_id', flat=True))
+
+        provided_ids = [item.get('item_id') for item in items_data]
+
+        for oid in provided_ids:
+            if oid not in valid_catalog_ids:
+                raise serializers.ValidationError(
+                    f"Item ID {oid} is not part of Order #{order.id}. "
+                    f"Valid Item IDs in this order are: {valid_catalog_ids}"
+                )
+
+        return attrs
 
     def save(self):
-        order = self.context['order']
-        for item_info in self.validated_data['items_data']:
-            item = order.items.get(id=item_info['item_id'])
-            # Saves the first image from the list to the model field
-            item.photo_finished = item_info['photos'][0]
-            item.save()
+        order = self.context.get('order')
+        # This matches the 'photos' array from your Swagger/Request
+        photos = self.context['request'].FILES.getlist('photos')
+        items_data = self.validated_data['items_data']
 
+        # Map photos to OrderItems based on item_type_id
+        for index, entry in enumerate(items_data):
+            catalog_id = entry.get('item_id')
+            # Find the specific OrderItem record
+            order_item = order.items.filter(item_type_id=catalog_id).first()
+
+            if order_item and index < len(photos):
+                order_item.photo_finished = photos[index]
+                order_item.save()
+
+        # Update order status
         order.status = 'FINISHED'
-        if 'request' in self.context:
-            order.processed_by = self.context['request'].user.profile
         order.save()
         return order

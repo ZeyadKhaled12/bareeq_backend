@@ -14,6 +14,7 @@ class Order(models.Model):
         ('AT_VENDOR', 'في المغسلة (At Vendor)'),
         ('FINISHED', 'جاهز (Finished)'),
         ('RETURNED', 'تم التسليم (Returned)'),
+        ('CANCELED', 'ملغي (Canceled)')
     ]
 
     barcode = models.CharField(
